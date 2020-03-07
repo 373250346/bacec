@@ -1,0 +1,548 @@
+导读
+用户管理可以说是运维工作最基础的部分，随着企业的发展，我们面对的将不仅仅使一个或多个系统，用户也可能成倍增长。此时统一用户认证LDAP或许是你的一种解决方案。
+
+
+
+蓝鲸作为腾讯互动娱乐事业群（Interactive Entertainment Group，简称 IEG）自研自用的一套用于构建企业研发运营一体化体系的 PaaS 开发框架，提供了 aPaaS（DevOps 流水线、运行环境托管、前后台框架）和 iPaaS（持续集成、CMDB、作业平台、容器管理、数据平台、AI 等原子平台）等模块，帮助企业技术人员快速构建基础运营 PaaS。
+
+
+
+当二者结合在一起会给你工作带来意想不到的收获！
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+蓝鲸官方文档社区版: “蓝鲸登录接入企业内部登录”中已经通过接入google登录的例子进行说明；但是公司内部只有ldap作为内部服务的统一认证，并不提供相关登录API，难道我们还要再自己搭建API？
+
+
+
+以上恐怕也是很多中小企业的现状，这种情况下该如何接入企业内部ldap呢？
+
+
+
+
+
+源码分析
+下面我们来分析下蓝鲸paas平台统一登录服务基本函数接口来看下登录流程，供我们参考
+
+1
+
+蓝鲸统一登录提供的基本函数
+from bkaccount.accounts import Account
+从以上python的模块导入来看，蓝鲸的登录跳转函数主要由Account类实现，其中登录页面和登录动作的功能主要由login实现：
+
+def login(self, request, template_name='login/login.html',
+              authentication_form=AuthenticationForm,
+              current_app=None, extra_context=None):
+        """
+        登录页面和登录动作
+        """
+        redirect_field_name = self.REDIRECT_FIELD_NAME
+        redirect_to = request.POST.get(redirect_field_name,
+                                       request.GET.get(redirect_field_name, ''))
+        app_id = request.POST.get('app_id', request.GET.get('app_id', ''))
+
+        if request.method == 'POST':
+            form = authentication_form(request, data=request.POST)
+            if form.is_valid():
+                return self.login_success_response(request, form, redirect_to, app_id)
+        else:
+            form = authentication_form(request)
+
+        current_site = get_current_site(request)
+        context = {
+            'form': form,
+            redirect_field_name: redirect_to,
+            'site': current_site,
+            'site_name': current_site.name,
+            'app_id': app_id,
+        }
+        if extra_context is not None:
+            context.update(extra_context)
+        if current_app is not None:
+            request.current_app = current_app
+
+        response = TemplateResponse(request, template_name, context)
+        response = self.set_bk_token_invalid(request, response)
+        return response
+其中当登录页面输入用户名、密码登录会发出POST请求，代码段如下：
+
+if request.method == 'POST':
+            form = authentication_form(request, data=request.POST)
+            if form.is_valid():
+                return self.login_success_response(request, form, redirect_to, app_id)
+        else:
+            form = authentication_form(request)
+authentication_form处理接收提交到用户名和密码，引用自：
+
+authentication_form=AuthenticationForm
+
+from django.contrib.auth.forms import AuthenticationForm
+
+其中AuthenticationForm是一个表单。
+
+
+
+2
+
+登录表单认证
+AuthenticationForm是一个表单，定义如下：
+
+class AuthenticationForm(forms.Form):
+    """
+    Base class for authenticating users. Extend this to get a form that accepts
+    username/password logins.
+    """
+    username = forms.CharField(max_length=254)
+    password = forms.CharField(label=_("Password"), widget=forms.PasswordInput)
+
+    error_messages = {
+        'invalid_login': _("Please enter a correct %(username)s and password. "
+                           "Note that both fields may be case-sensitive."),
+        'inactive': _("This account is inactive."),
+    }
+
+    def __init__(self, request=None, *args, **kwargs):
+        """
+        The 'request' parameter is set for custom auth use by subclasses.
+        The form data comes in via the standard 'data' kwarg.
+        """
+        self.request = request
+        self.user_cache = None
+        super(AuthenticationForm, self).__init__(*args, **kwargs)
+
+        # Set the label for the "username" field.
+        UserModel = get_user_model()
+        self.username_field = UserModel._meta.get_field(UserModel.USERNAME_FIELD)
+        if self.fields['username'].label is None:
+            self.fields['username'].label = capfirst(self.username_field.verbose_name)
+
+    def clean(self):
+        username = self.cleaned_data.get('username')
+        password = self.cleaned_data.get('password')
+
+        if username and password:
+            self.user_cache = authenticate(username=username,
+                                           password=password)
+            if self.user_cache is None:
+                raise forms.ValidationError(
+                    self.error_messages['invalid_login'],
+                    code='invalid_login',
+                    params={'username': self.username_field.verbose_name},
+                )
+            else:
+                self.confirm_login_allowed(self.user_cache)
+
+        return self.cleaned_data
+
+    def confirm_login_allowed(self, user):
+        """
+        Controls whether the given User may log in. This is a policy setting,
+        independent of end-user authentication. This default behavior is to
+        allow login by active users, and reject login by inactive users.
+
+        If the given user cannot log in, this method should raise a
+        ``forms.ValidationError``.
+
+        If the given user may log in, this method should return None.
+        """
+        if not user.is_active:
+            raise forms.ValidationError(
+                self.error_messages['inactive'],
+                code='inactive',
+            )
+
+    def get_user_id(self):
+        if self.user_cache:
+            return self.user_cache.id
+        return None
+
+    def get_user(self):
+        return self.user_cache
+django的表单功能我们可以知道，获取到前端request.post的数据需要经表单进行clean验证，最终返回cleaned_data字典，代码段如下：
+
+def clean(self):
+        username = self.cleaned_data.get('username')
+        password = self.cleaned_data.get('password')
+
+        if username and password:
+            self.user_cache = authenticate(username=username,
+                                           password=password)
+            if self.user_cache is None:
+                raise forms.ValidationError(
+                    self.error_messages['invalid_login'],
+                    code='invalid_login',
+                    params={'username': self.username_field.verbose_name},
+                )
+            else:
+                self.confirm_login_allowed(self.user_cache)
+
+        return self.cleaned_data
+从代码看出，如果用户名、密码不为空，调用authenticate进行验证。
+
+引用来自：
+
+from django.contrib.auth import authenticate
+
+而authenticate正是自定义接入企业登录模块需要重写的函数，也就和“蓝鲸登录接入企业内部登录”中的说明对上了。
+
+
+
+03
+
+登录总结
+公司在没有登录API的情况下，我们最终可以通过重写AuthenticationForm表单的clean方法来进行自主本地认证。
+
+
+
+
+
+
+企业接入
+1
+
+登录功能描述
+1.普通用户登录先经ldap认证
+    a.若ldap中存在，蓝鲸中不存在，则创建新用户并将其设置为普通用户；
+    b.若ldap中不存在，则进入蓝鲸默认的页面跳转动作；
+2.admin用户登录跳过ldap认证，直接走蓝鲸认证；
+
+
+
+思考：
+对于ldap无法连接或连接失败的状况，可以跳过ldap认证，走蓝鲸认证。这个功能在本次开发中没有完成，大家可自行实现。
+
+
+
+2
+
+目录结构
+ee_login/
+├── enterprise_ldap       ##自定义登录模块目录
+│   ├── backends.py       ##验证用户合法性 
+│   ├── __init__.py
+│   ├── ldap.py           ##接入ldap并获取用户信息
+│   ├── utils.py          ##自定义表单，集成AuthenticationForm，重写clean方法
+│   ├── views.py          ##登录处理逻辑函数
+├── __init__.py
+└── settings_login.py     ##自定义登录配置文件
+
+
+
+3
+
+创建模块目录及配置文件
+#paas所在机器
+#安装ldap模块
+workon open_paas-login
+pip install ldap3
+一定要是在open_paas-login这个虚拟环境下，否则ldap会找不到
+
+#中控机
+cd /data/bkce/open_paas/login/ee_login
+#创建自定义登录模块目录
+#此目录下的py文件可使用以下代码部分直接创建即可
+mkdir enterprise_ldap
+#修改配置文件
+vim settings_login.py
+# -*- coding: utf-8 -*-
+# 蓝鲸登录方式：bk_login
+# 自定义登录方式：custom_login
+
+#LOGIN_TYPE = 'bk_login'
+LOGIN_TYPE = 'custom_login'
+
+# 默认bk_login，无需设置其他配置
+
+###########################
+# 自定义登录 custom_login   #
+###########################
+# 配置自定义登录请求和登录回调的响应函数, 如：CUSTOM_LOGIN_VIEW = 'ee_official_login.oauth.google.views.login'
+CUSTOM_LOGIN_VIEW = 'ee_login.enterprise_ldap.views.login'
+# 配置自定义验证是否登录的认证函数, 如：CUSTOM_AUTHENTICATION_BACKEND = 'ee_official_login.oauth.google.backends.OauthBackend'
+CUSTOM_AUTHENTICATION_BACKEND = 'ee_login.enterprise_ldap.backends.ldapbackend'
+4
+
+登录请求和登录回调函数
+vim enterprise_ldap/views.py
+# -*- coding: utf-8 -*-
+    
+from django.http.response import HttpResponse
+from bkaccount.accounts import Account
+from django.contrib.sites.shortcuts import get_current_site
+from django.template.response import TemplateResponse
+from .utils import CustomLoginForm 
+
+def login(request, template_name='login/login.html',
+              authentication_form=CustomLoginForm,
+              current_app=None, extra_context=None):
+    """
+    登录处理，
+    """
+    account = Account()
+    
+    # 获取用户实际请求的 URL, 目前 account.REDIRECT_FIELD_NAME = 'c_url'
+    redirect_to = request.GET.get(account.REDIRECT_FIELD_NAME, '')
+    # 获取用户实际访问的蓝鲸应用
+    app_id = request.GET.get('app_id', '')
+    redirect_field_name = account.REDIRECT_FIELD_NAME
+    
+    if request.method == 'POST':
+        #通过自定义表单CustomLoginForm实现登录验证
+        form = authentication_form(request, data=request.POST)
+        if form.is_valid():
+            #验证通过跳转
+            return account.login_success_response(request, form, redirect_to, app_id)
+    else:
+        form = authentication_form(request)
+    
+    current_site = get_current_site(request)
+    context = {
+        'form': form,
+        redirect_field_name: redirect_to,
+        'site': current_site,
+        'site_name': current_site.name,
+        'app_id': app_id,
+    }
+    if extra_context is not None:
+        context.update(extra_context)
+    if current_app is not None:
+        request.current_app = current_app
+    response = TemplateResponse(request, template_name, context)
+    response = account.set_bk_token_invalid(request, response)
+    return response
+login函数是参照蓝鲸自带的login函数，它们之间的区别就是调用了不同的表单，在此我们调用的是重写AuthenticationForm后的表单，引用于：
+
+from .utils import CustomLoginForm
+
+这样login登录就不需要走API了，在本地就可实现。
+
+
+
+登录后的跳转处理仍使用原来的处理，通过account调用跳转函数即可。
+
+
+
+5
+
+自定义表单
+
+
+vim enterprise_ldap/utils.py
+# -*- coding: utf-8 -*-
+from django import forms
+from django.contrib.auth.forms import AuthenticationForm
+from django.contrib.auth import authenticate
+from common.log import logger
+
+class CustomLoginForm(AuthenticationForm):
+    """
+    重写AuthenticationForm类，用于自定义登录custom_login
+    """
+    def clean(self):
+        username = self.cleaned_data.get('username')
+        password = self.cleaned_data.get('password')
+        if username and password:
+            self.user_cache = authenticate(username=username,
+                                           password=password)
+            if self.user_cache is None:
+                raise forms.ValidationError(
+                    self.error_messages['invalid_login'],
+                    code='invalid_login',
+                    params={'username': self.username_field.verbose_name},
+                )
+            else:
+                super(CustomLoginForm, self).confirm_login_allowed(self.user_cache)
+
+        return self.cleaned_data
+重写了父类AuthenticationForm中的clean方法，因为clean方法中调用了authenticate进行了对用户名、密码的验证。
+
+6
+
+用户认证功能实现
+
+
+vim enterprise_ldap/backends.py
+# -*- coding: utf-8 -*-
+
+from django.contrib.auth.backends import ModelBackend
+from .ldap import SearchLdap
+from django.contrib.auth import get_user_model
+from bkaccount.constants import RoleCodeEnum
+from common.log import logger
+
+class ldapbackend(ModelBackend):
+    def authenticate(self, **credentials):   
+        username = credentials.get('username')
+        password = credentials.get('password')
+              
+        if username and password:
+            logger.info("username: %s,password: %s" % (username,password))
+            #当登录账号为admin时，直接在蓝鲸验证，不走ldap认证
+            if username == 'admin':
+                logger.info(u'用户为admin，直接蓝鲸验证')
+                return super(ldapbackend, self).authenticate(username=username, password=password)
+            else:
+                ldapinfo = SearchLdap()
+                resp = ldapinfo.get_user_info(username=username, password=password)
+                #如果ldap中存在此用户
+                if resp["result"] == "success":
+                    # 获取用户类 Model（即对应用户表）
+                    user_model = get_user_model()
+                    try:
+                        user = user_model.objects.get(username=username)
+                    except user_model.DoesNotExist:
+                        # 创建 User 对象
+                        user = user_model.objects.create_user(username)
+                        # 获取用户信息，只在第一次创建时设置，已经存在不更新
+                        chname = resp['data']['chname']
+                        phone = resp['data']['mobile']
+                        email = resp['data']['email']
+                        user.chname = chname
+                        user.phone = phone
+                        user.email = email
+                        user.save()
+                        # 设置新增用户角色为普通管理员
+                        logger.info(u'新建用户：%s 权限：%s' % (chname, u'普通用户'))
+                        result, message = user_model.objects.modify_user_role(username, RoleCodeEnum.STAFF)
+                    return user             
+                else:
+                    return None
+        else:
+            return None
+用户认证主要通过authenticate函数实现：
+
+1.登录ldap后过滤相应的用户cn、mail、mobile字段，并判断是否在蓝鲸数据库中存在，不存在则新建用户并授予普通管理员角色；
+2.登录用户为admin，则直接蓝鲸认证；
+
+
+
+7
+
+LDAP获取用户信息
+vim enterprise_ldap/backends.py
+# -*- coding: utf-8 -*-
+
+from ldap3 import Connection, Server, SUBTREE
+from common.log import logger
+
+class SearchLdap:
+    host = '10.90.10.123'
+    port = 389
+    ldap_base = 'dc=test,dc=cn'
+    def get_user_info(self, **kwargs):
+        
+        username = kwargs.get("username")
+        password = kwargs.get("password")
+
+        ldap_user = 'cn='+username+','+self.ldap_base
+
+        try:
+            #与ldap建立连接
+            s = Server(host=self.host, port=self.port, use_ssl=False, get_info='ALL', connect_timeout=5)
+            #bind打开连接
+            c = Connection(s, user=ldap_user, password=password, auto_bind='NONE', version=3, authentication='SIMPLE', client_strategy='SYNC', auto_referrals=True, check_names=True, read_only=True, lazy=False, raise_exceptions=False)
+    
+            c.bind()
+            logger.info(c.result)
+            #认证正确-success 不正确-invalidCredentials
+            if c.result['description'] == 'success':
+                res = c.search(search_base=self.ldap_base, search_filter = "(cn="+username+")", search_scope = SUBTREE, attributes = ['cn', 'mobile', 'mail'], paged_size = 5)
+                if res:
+                    attr_dict = c.response[0]["attributes"]
+                    chname = attr_dict['cn'][0]
+                    email = attr_dict['mail'][0]
+                    mobile = attr_dict['mobile'][0]           
+                    data = {
+                        'username': "%s" % username,
+                        'password': "%s" % password,
+                        'chname': "%s" % chname,
+                        'email': "%s" % email,
+                        'mobile' : "%s" % mobile,
+                    }
+                    logger.info(u'ldap成功匹配用户')
+                    result = {
+                        'result': "success",
+                        'message':'验证成功',
+                        'data':data
+                    }
+                else:
+                    logger.info(u'ldap无此用户信息')
+                    result = {
+                        'result': "null",
+                        'message':'result is null'
+                    }
+                #关闭连接
+                c.unbind()
+            else:
+                logger.info(u"用户认证失败")
+                result = {
+                    'result': "auth_failure",
+                    'message': "user auth failure"
+                }
+                
+        except Exception as e:
+            logger.info(u'ldap连接出错: %s' % e)
+            result = {
+                'result': 'conn_error',
+                'message': "connect error"
+            }
+        
+        return result
+登录验证用户是否存在，需注意：
+
+1.ldap用户名、密码登录是否成功一定要通过c.result的description字段是否为success来确认，否则即使认证不成功，也能连接并过滤到信息。此时在蓝鲸登录时会出现，只要是ldap中有的账户，即使密码不正确也能成功登录；
+
+2.ldap登录时的用户名一定要是“cn=test,dc=test,dc=cn”（具体格式根据实际情况调整），否则登录是不成功的，但也能正常过滤信息；
+
+
+3.ldap中的用户一定要有cn，mail，mobile等字段，否则账户即使存在登录也会不成功；
+
+
+
+8
+
+重启login服务并使配置生效
+/data/install/bkcec stop paas login
+/data/install/bkcec start paas login
+9
+
+登录查看访问日志
+cd /data/bkce/logs/open_paas/
+login_uwsgi.log   login.log
+
+
+
+
+总结
+通过蓝鲸paas平台的统一登录服务的源码解析，不仅仅是功能上的实现，更重要的是参考大厂研发代码的布局、流程、规范等，给我们自身带来的启发。
+
+
+
+
+
+
+
+
+END
+
+
+
+扫码关注更多精彩
+
+qrcode_for_gh_a6587d2962bd_258.jpg
+
+END
+
