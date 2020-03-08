@@ -447,8 +447,8 @@ class SearchLdap:
         username = kwargs.get("username")
         password = kwargs.get("password")
 
-        ldap_user = 'cn='+username+','+self.ldap_base
-
+        #ldap_user = 'cn='+username+','+self.ldap_base #适用于对接openladp版本
+        ldap_user = 'domain//'+username   
         try:
             #与ldap建立连接
             s = Server(host=self.host, port=self.port, use_ssl=False, get_info='ALL', connect_timeout=5)
@@ -459,7 +459,7 @@ class SearchLdap:
             logger.info(c.result)
             #认证正确-success 不正确-invalidCredentials
             if c.result['description'] == 'success':
-                res = c.search(search_base=self.ldap_base, search_filter = "(cn="+username+")", search_scope = SUBTREE, attributes = ['cn', 'mobile', 'mail'], paged_size = 5)
+                res = c.search(search_base=self.ldap_base, search_filter = "(sAMAccountName="+username+")", search_scope = SUBTREE, attributes = ['cn', 'mobile', 'mail'], paged_size = 5)
                 if res:
                     attr_dict = c.response[0]["attributes"]
                     chname = attr_dict['cn'][0]
